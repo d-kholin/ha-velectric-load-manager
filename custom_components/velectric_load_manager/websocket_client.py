@@ -308,48 +308,55 @@ class VElectricWebSocketClient:
         """
         Process current readings and load status message
 
-        Message format:
-        Bytes 0-1: CT1 raw reading (uint16, little-endian)
-        Bytes 2-3: CT2 raw reading (uint16, little-endian)
-        Bytes 4-5: Load 1 counter (uint16, little-endian)
-        Bytes 6-7: Load 2 counter (uint16, little-endian)
-        Bytes 8-9: Load 3 counter (uint16, little-endian)
-        Byte 10: Load 1 status (0=off, 1=on, 2=wait-off, 3=wait-on)
-        Byte 11: Load 2 status
-        Byte 12: Load 3 status
+        Observed packet layout (bytes 2-3 are a reserved/unknown field, always 0):
+          Bytes 0-1:  CT1 raw reading (uint16, little-endian)
+          Bytes 2-3:  Reserved (always 0 — not CT2)
+          Bytes 4-5:  CT2 raw reading (uint16, little-endian)
+          Bytes 6-7:  Load 1 counter (uint16, little-endian)
+          Bytes 8-9:  Load 2 counter (uint16, little-endian)
+          Byte  10:   Load 1 status (0=off, 1=on, 2=wait-off, 3=wait-on)
+          Byte  11:   Load 2 status
+          Byte  12:   Load 3 status
+          — 15-byte extended variant also carries Load 3 counter at bytes 10-11
+            and shifts statuses to bytes 12-14.
         """
         if len(data) < 13:
             _LOGGER.debug("Ignoring short readings packet: %d bytes", len(data))
             return
 
-        # Parse current readings (bytes 0-3)
-        # Raw values need square root calculation to get actual current
-        ct1_raw = struct.unpack("<H", data[0:2])[0]  # Little-endian uint16
-        ct2_raw = struct.unpack("<H", data[2:4])[0]  # Little-endian uint16
+        # Bytes 2-3 are a reserved field (always 0); CT2 is at bytes 4-5.
+        ct1_raw = struct.unpack("<H", data[0:2])[0]
+        ct2_raw = struct.unpack("<H", data[4:6])[0]
 
-        ct1_current = math.sqrt(ct1_raw) * 1  # Apply scale factor
-        ct2_current = math.sqrt(ct2_raw) * 1  # Apply scale factor
+        ct1_current = math.sqrt(ct1_raw)
+        ct2_current = math.sqrt(ct2_raw)
 
         self.current_readings = CurrentReadings(
             ct1=round(ct1_current, 1), ct2=round(ct2_current, 1)
         )
 
-        # Update legacy readings dict
         async with self._lock:
             self._latest_readings = {
                 "ct1": self.current_readings.ct1,
                 "ct2": self.current_readings.ct2,
             }
 
-        # Parse load counters (bytes 4-9) - used for timing calculations
-        load_counters = [
-            struct.unpack("<H", data[4:6])[0],  # Load 1 counter
-            struct.unpack("<H", data[6:8])[0],  # Load 2 counter
-            struct.unpack("<H", data[8:10])[0],  # Load 3 counter
-        ]
-
-        # Parse load status (bytes 10-12)
-        load_status_bytes = [data[10], data[11], data[12]]
+        # 15-byte variant carries all three load counters; 13-14-byte variant
+        # carries only Load 1 and Load 2 counters (Load 3 counter absent).
+        if len(data) >= 15:
+            load_counters = [
+                struct.unpack("<H", data[6:8])[0],
+                struct.unpack("<H", data[8:10])[0],
+                struct.unpack("<H", data[10:12])[0],
+            ]
+            load_status_bytes = [data[12], data[13], data[14]]
+        else:
+            load_counters = [
+                struct.unpack("<H", data[6:8])[0],
+                struct.unpack("<H", data[8:10])[0],
+                0,
+            ]
+            load_status_bytes = [data[10], data[11], data[12]]
 
         # Get delay settings from current configuration
         turn_on_delays = [load.turn_on_delay for load in self.settings.loads]
