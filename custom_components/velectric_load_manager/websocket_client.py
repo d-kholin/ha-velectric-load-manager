@@ -254,6 +254,16 @@ class VElectricWebSocketClient:
         """
         _LOGGER.debug("Raw packet (%d bytes): %s", len(data), data.hex(" "))
 
+        # Firmware variant: 20-byte readings frame with 32-bit fields.
+        if len(data) == 20:
+            await self._process_readings_message_20(data)
+            return
+
+        # Firmware variant: 26-byte settings frame with 16-bit fields.
+        if len(data) == 26:
+            await self._process_settings_message_26(data)
+            return
+
         # Some firmware variants prepend a 1-byte message type.
         # Handle both plain 12-byte settings and 13-byte (1-byte prefix + 12-byte payload).
         if len(data) == 13 and all(status in (0, 1, 2, 3) for status in data[10:13]):
@@ -342,6 +352,79 @@ class VElectricWebSocketClient:
             self.on_settings_update(self.settings)
 
         self._settings_received = True
+
+    async def _process_settings_message_26(self, data: bytes) -> None:
+        """Process 26-byte settings message variant using 16-bit fields."""
+        words = struct.unpack("<13H", data)
+
+        loads = [
+            LoadConfig(load_breaker=words[1], turn_on_delay=words[2], turn_off_delay=words[3]),
+            LoadConfig(load_breaker=words[4], turn_on_delay=words[5], turn_off_delay=words[6]),
+            LoadConfig(load_breaker=words[7], turn_on_delay=words[8], turn_off_delay=words[9]),
+        ]
+
+        # Active channels and CT index positions differ across firmware revisions.
+        active_candidates = [words[10], words[12] & 0xFF, words[12] >> 8]
+        active_ch = next((value for value in active_candidates if 1 <= value <= 3), 2)
+
+        ct_index_candidates = [words[12] & 0xFF, words[12] >> 8, words[10]]
+        ct_index = next((value for value in ct_index_candidates if 0 <= value <= 8), 0)
+
+        ct_rating = words[11] if 25 <= words[11] <= 400 else 100 * (ct_index + 1)
+
+        self.settings = Settings(
+            main_supply_breaker=words[0],
+            loads=loads,
+            active_ch=active_ch,
+            ct_index=ct_index,
+            scale=1,
+            ct_rating=ct_rating,
+        )
+
+        _LOGGER.debug(
+            "Parsed 26-byte settings: main=%d loads=%s active=%d ct_index=%d ct_rating=%d",
+            self.settings.main_supply_breaker,
+            [(load.load_breaker, load.turn_on_delay, load.turn_off_delay) for load in loads],
+            self.settings.active_ch,
+            self.settings.ct_index,
+            self.settings.ct_rating,
+        )
+
+        if self.on_settings_update:
+            self.on_settings_update(self.settings)
+
+        self._settings_received = True
+
+    async def _process_readings_message_20(self, data: bytes) -> None:
+        """Process 20-byte readings message variant using 32-bit fields."""
+        ct1_raw, ct2_raw, load1_counter, load2_counter, load3_counter = struct.unpack(
+            "<5I", data
+        )
+
+        self.current_readings = CurrentReadings(
+            ct1=round(math.sqrt(ct1_raw), 1),
+            ct2=round(math.sqrt(ct2_raw), 1),
+        )
+
+        async with self._lock:
+            self._latest_readings = {
+                "ct1": self.current_readings.ct1,
+                "ct2": self.current_readings.ct2,
+            }
+
+        _LOGGER.debug(
+            "20-byte parse: ct1_raw=%d ct2_raw=%d -> ct1=%.1fA ct2=%.1fA counters=[%d,%d,%d]",
+            ct1_raw,
+            ct2_raw,
+            self.current_readings.ct1,
+            self.current_readings.ct2,
+            load1_counter,
+            load2_counter,
+            load3_counter,
+        )
+
+        if self.on_current_reading:
+            self.on_current_reading(self.current_readings, self.load_status)
 
     async def _process_readings_message(self, data: bytes) -> None:
         """
