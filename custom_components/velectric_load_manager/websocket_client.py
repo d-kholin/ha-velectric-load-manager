@@ -82,6 +82,8 @@ class VElectricWebSocketClient:
         self._message_task: asyncio.Task | None = None
         self._latest_readings: dict[str, float] = {"ct1": 0.0, "ct2": 0.0}
         self._lock = asyncio.Lock()
+        self._settings_received = False
+        self._settings_request_counter = 0
 
         # Initialize default settings
         default_loads = [
@@ -197,6 +199,12 @@ class VElectricWebSocketClient:
         """Send periodic ping requests to get readings."""
         while self._connected and self._websocket:
             try:
+                # Periodically request settings until we receive a valid settings packet.
+                if not self._settings_received:
+                    self._settings_request_counter += 1
+                    if self._settings_request_counter % 5 == 0:
+                        await self._send_command(105)
+
                 await self._websocket.send(bytes([WS_REQUEST_BYTE]))
                 _LOGGER.debug("Sent reading request")
                 await asyncio.sleep(PING_INTERVAL)
@@ -244,12 +252,50 @@ class VElectricWebSocketClient:
         1. Settings/Config (12 bytes) - Contains device configuration
         2. Status/Readings (13+ bytes) - Contains current readings and load status
         """
-        if len(data) == 12:
-            # Configuration/Settings message (12 bytes)
-            await self._process_settings_message(data)
-        else:
-            # Current readings and load status message (13+ bytes)
+        _LOGGER.debug("Raw packet (%d bytes): %s", len(data), data.hex(" "))
+
+        # Some firmware variants prepend a 1-byte message type.
+        # Handle both plain 12-byte settings and 13-byte (1-byte prefix + 12-byte payload).
+        if len(data) == 13 and all(status in (0, 1, 2, 3) for status in data[10:13]):
             await self._process_readings_message(data)
+            return
+
+        if len(data) in (12, 13):
+            settings_payload = self._extract_payload(data, 12)
+            if settings_payload is not None and self._looks_like_settings_payload(
+                settings_payload
+            ):
+                await self._process_settings_message(settings_payload)
+                return
+
+        # Current readings and load status message (13-byte payload, optionally prefixed)
+        await self._process_readings_message(data)
+
+    @staticmethod
+    def _extract_payload(data: bytes, payload_len: int) -> bytes | None:
+        """Extract payload with optional 1-byte message prefix."""
+        if len(data) == payload_len:
+            return data
+        if len(data) == payload_len + 1:
+            return data[1:]
+        return None
+
+    @staticmethod
+    def _looks_like_settings_payload(data: bytes) -> bool:
+        """Return True when a 12-byte payload looks like settings data."""
+        if len(data) != 12:
+            return False
+
+        active_channels = data[10]
+        ct_index = data[11]
+
+        # These fields are tightly constrained in normal operation.
+        if active_channels > 3:
+            return False
+        if ct_index > 8:
+            return False
+
+        return True
 
     async def _process_settings_message(self, data: bytes) -> None:
         """
@@ -295,6 +341,8 @@ class VElectricWebSocketClient:
         if self.on_settings_update:
             self.on_settings_update(self.settings)
 
+        self._settings_received = True
+
     async def _process_readings_message(self, data: bytes) -> None:
         """
         Process current readings and load status message
@@ -309,24 +357,56 @@ class VElectricWebSocketClient:
         Byte 11: Load 2 status
         Byte 12: Load 3 status
         """
-        if len(data) < 13:
-            # Handle legacy 14-byte current-only messages
-            if len(data) == PACKET_SIZE:
-                readings = self.decode_currents(data)
-                async with self._lock:
-                    self._latest_readings = readings
-                    self.current_readings = CurrentReadings(
-                        ct1=readings["ct1"], ct2=readings["ct2"]
-                    )
-                _LOGGER.debug("Updated readings: %s", readings)
-                if self.on_current_reading:
-                    self.on_current_reading(self.current_readings, self.load_status)
+        ct1_raw = 0
+        ct2_raw = 0
+        load_counters: list[int] = []
+        load_status_bytes: list[int] = []
+        parsed = False
+
+        # Primary parser: 13-byte readings payload with optional 1-byte prefix.
+        for offset in (0, 1):
+            if len(data) < offset + 13:
+                continue
+
+            candidate_status = [
+                data[offset + 10],
+                data[offset + 11],
+                data[offset + 12],
+            ]
+            if not all(status in (0, 1, 2, 3) for status in candidate_status):
+                continue
+
+            ct1_raw = struct.unpack("<H", data[offset : offset + 2])[0]
+            ct2_raw = struct.unpack("<H", data[offset + 2 : offset + 4])[0]
+            load_counters = [
+                struct.unpack("<H", data[offset + 4 : offset + 6])[0],
+                struct.unpack("<H", data[offset + 6 : offset + 8])[0],
+                struct.unpack("<H", data[offset + 8 : offset + 10])[0],
+            ]
+            load_status_bytes = candidate_status
+            parsed = True
+            break
+
+        # Legacy fallback: current-only packet.
+        if not parsed:
+            legacy_packet = self._extract_payload(data, PACKET_SIZE)
+            if legacy_packet is None:
+                _LOGGER.debug("Ignoring unsupported packet length: %d", len(data))
+                return
+
+            readings = self.decode_currents(legacy_packet)
+            async with self._lock:
+                self._latest_readings = readings
+                self.current_readings = CurrentReadings(
+                    ct1=readings["ct1"], ct2=readings["ct2"]
+                )
+
+            _LOGGER.debug("Updated legacy readings: %s", readings)
+            if self.on_current_reading:
+                self.on_current_reading(self.current_readings, self.load_status)
             return
 
-        # Parse current readings (bytes 0-3)
         # Raw values need square root calculation to get actual current
-        ct1_raw = struct.unpack("<H", data[0:2])[0]  # Little-endian uint16
-        ct2_raw = struct.unpack("<H", data[2:4])[0]  # Little-endian uint16
 
         ct1_current = math.sqrt(ct1_raw) * 1  # Apply scale factor
         ct2_current = math.sqrt(ct2_raw) * 1  # Apply scale factor
@@ -342,15 +422,13 @@ class VElectricWebSocketClient:
                 "ct2": self.current_readings.ct2,
             }
 
-        # Parse load counters (bytes 4-9) - used for timing calculations
-        load_counters = [
-            struct.unpack("<H", data[4:6])[0],  # Load 1 counter
-            struct.unpack("<H", data[6:8])[0],  # Load 2 counter
-            struct.unpack("<H", data[8:10])[0],  # Load 3 counter
-        ]
-
-        # Parse load status (bytes 10-12)
-        load_status_bytes = [data[10], data[11], data[12]]
+        _LOGGER.debug(
+            "CT raw values: ct1=%d ct2=%d -> ct1=%.1fA ct2=%.1fA",
+            ct1_raw,
+            ct2_raw,
+            self.current_readings.ct1,
+            self.current_readings.ct2,
+        )
 
         # Get delay settings from current configuration
         turn_on_delays = [load.turn_on_delay for load in self.settings.loads]
