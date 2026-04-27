@@ -243,10 +243,19 @@ class VElectricWebSocketClient:
         Two types of messages:
         1. Settings/Config (12 bytes) - Contains device configuration
         2. Status/Readings (13+ bytes) - Contains current readings and load status
+
+        Some firmware versions prefix the settings response with the originating
+        command byte (105), making it 13 bytes total.
         """
+        _LOGGER.debug("Received %d-byte binary message: %s", len(data), data.hex())
+
         if len(data) == 12:
-            # Configuration/Settings message (12 bytes)
+            # Standard settings/config message
             await self._process_settings_message(data)
+        elif len(data) == 13 and data[0] == 105:
+            # Settings response prefixed with the init command echo (byte 105)
+            _LOGGER.debug("Parsing 13-byte settings echo (prefix byte: %d)", data[0])
+            await self._process_settings_message(data[1:])
         else:
             # Current readings and load status message (13+ bytes)
             await self._process_readings_message(data)
@@ -310,17 +319,7 @@ class VElectricWebSocketClient:
         Byte 12: Load 3 status
         """
         if len(data) < 13:
-            # Handle legacy 14-byte current-only messages
-            if len(data) == PACKET_SIZE:
-                readings = self.decode_currents(data)
-                async with self._lock:
-                    self._latest_readings = readings
-                    self.current_readings = CurrentReadings(
-                        ct1=readings["ct1"], ct2=readings["ct2"]
-                    )
-                _LOGGER.debug("Updated readings: %s", readings)
-                if self.on_current_reading:
-                    self.on_current_reading(self.current_readings, self.load_status)
+            _LOGGER.debug("Ignoring short readings packet: %d bytes", len(data))
             return
 
         # Parse current readings (bytes 0-3)
