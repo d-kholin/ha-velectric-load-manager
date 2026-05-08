@@ -14,7 +14,7 @@ CONF_SCAN_INTERVAL: Final = "scan_interval"
 # Default values
 DEFAULT_PORT: Final = 80
 DEFAULT_SCAN_INTERVAL: Final = 5  # seconds (reduced from 2s to be less aggressive)
-DEFAULT_VOLTAGE: Final = 240  # Standard household voltage
+DEFAULT_VOLTAGE: Final = 120  # Voltage per leg (split-phase: each CT measures one 120V leg)
 
 # Device info
 MANUFACTURER: Final = "VElectric"
